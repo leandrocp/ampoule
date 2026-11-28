@@ -14,6 +14,7 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 - `:io.columns/0` and `:io.rows/0` return the terminal size instead of `{:error, :enotsup}`.
 - `IO.ANSI.enabled?/0` and `:prim_tty.isatty/1` are true when stdio is a terminal.
+- Rust NIFs pack on Rustler 0.39.
 
 ## [0.1.16] - 2026-11-25
 
