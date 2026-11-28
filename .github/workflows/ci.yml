@@ -12,12 +12,14 @@ concurrency:
 permissions:
   contents: read
 
+# Lint, unit tests and the build run side by side; the smoke test and the examples only wait for
+# the build. The Rust caches are saved from main only: each is over a gigabyte, and copies saved by
+# pull requests push main's out of the repository's 10 GB.
 jobs:
   engine:
     uses: ./.github/workflows/engine.yml
 
-  # Lint, unit tests, the release binary, and the smoke test (test/fixture packed and checked).
-  test:
+  lint:
     needs: engine
     strategy:
       fail-fast: false
@@ -38,22 +40,10 @@ jobs:
           components: clippy, rustfmt
           targets: wasm32-wasip1-threads
 
-      # The Rust cache unpacks to several GB; on the hosted Ubuntu image that has filled the disk
-      # during its restore. The image's .NET, Android and GHC toolchains are never used here.
-      - name: Free disk space
-        if: runner.os == 'Linux'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
-          df -h /
-
       - uses: Swatinem/rust-cache@v2.9.2
         with:
           workspaces: runner
-
-      - uses: erlef/setup-beam@v1.24.1
-        with:
-          otp-version: "28.5.0.9"
-          elixir-version: "1.20.5"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Lint
         working-directory: runner
@@ -62,19 +52,109 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo clippy --all-targets --no-default-features --target-dir target/lean -- -D warnings
 
+  unit:
+    needs: engine
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: engine
+          path: build/engine
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.99.0"
+          targets: wasm32-wasip1-threads
+
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: runner
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          otp-version: "28.5.0.9"
+          elixir-version: "1.20.5"
+
       - name: Unit tests
         working-directory: runner
         run: cargo test
 
-      # The lean runtime (no Cranelift) goes next to ampoule, as in a release, so the smoke test and
-      # every example pack on it.
+  # ampoule and the lean runtime (no Cranelift), with the `ci` profile: `release` without its LTO.
+  # The lean runtime goes next to ampoule, as in a release, so the smoke test and every example
+  # pack on it.
+  build:
+    needs: engine
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: engine
+          path: build/engine
+
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: "1.99.0"
+
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: runner
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Build
         working-directory: runner
         run: |
-          cargo build --release
-          cargo build --release --no-default-features --target-dir target/lean
-          target=$(target/release/ampoule version | sed -E 's/.*\(([a-z0-9_]+-[a-z]+),.*/\1/')
-          cp target/lean/release/ampoule "target/release/ampoule-$target"
+          cargo build --profile ci
+          cargo build --profile ci --no-default-features --target-dir target/lean
+          target=$(target/ci/ampoule version | sed -E 's/.*\(([a-z0-9_]+-[a-z]+),.*/\1/')
+          cp target/lean/ci/ampoule "target/ci/ampoule-$target"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ampoule-${{ matrix.os }}
+          path: runner/target/ci/ampoule*
+          if-no-files-found: error
+
+  # test/fixture packed and checked, against the binary the build job made.
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: engine
+          path: build/engine
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ampoule-${{ matrix.os }}
+          path: runner/target/release
+
+      - name: Make the binaries executable
+        run: chmod +x runner/target/release/ampoule*
+
+      - uses: erlef/setup-beam@v1.24.1
+        with:
+          otp-version: "28.5.0.9"
+          elixir-version: "1.20.5"
 
       - name: Fetch wasi-sdk (to build NIFs at pack time)
         run: elixir scripts/engine.exs sdk
@@ -82,38 +162,33 @@ jobs:
       - name: Smoke test
         run: elixir scripts/smoke.exs --network
 
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ampoule-${{ matrix.os }}
-          path: runner/target/release/ampoule*
-          if-no-files-found: error
-
-  # Each example's end-to-end suite (examples/*/test/e2e) against the binary the test job built:
-  # pack the example, run the binary, test it from outside.
+  # Each example's end-to-end suite (examples/*/test/e2e) against the binary the build job made:
+  # pack the example, run the binary, test it from outside. The quick ones share a job: macOS
+  # runners are few, and each job spends most of a minute setting up.
   examples:
-    needs: test
+    needs: build
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
-        example: [c_nif, cluster, francis, phoenix_ecto, ports, rustler, sqlite]
+        examples: ["cluster francis ports", "c_nif sqlite", rustler]
         rustler: [locked]
         include:
-          - os: ubuntu-24.04
-            example: rustler
-            rustler: "0.38.0"
-          - os: macos-15
-            example: rustler
-            rustler: "0.38.0"
-        exclude:
           # Needs Postgres, and macOS runners cannot run service containers.
+          - os: ubuntu-24.04
+            examples: phoenix_ecto
+            rustler: locked
+          - os: ubuntu-24.04
+            examples: rustler
+            rustler: "0.38.0"
           - os: macos-15
-            example: phoenix_ecto
-    name: examples (${{ matrix.example }}${{ matrix.rustler != 'locked' && format(' {0}', matrix.rustler) || '' }}, ${{ matrix.os }})
+            examples: rustler
+            rustler: "0.38.0"
+    name: examples (${{ matrix.examples }}${{ matrix.rustler != 'locked' && format(' {0}', matrix.rustler) || '' }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     services:
       postgres:
-        image: ${{ matrix.example == 'phoenix_ecto' && 'postgres:17' || '' }}
+        image: ${{ matrix.examples == 'phoenix_ecto' && 'postgres:17' || '' }}
         env:
           POSTGRES_PASSWORD: postgres
         ports: ["5432:5432"]
@@ -137,7 +212,7 @@ jobs:
         run: chmod +x runner/target/release/ampoule*
 
       - uses: dtolnay/rust-toolchain@v1
-        if: matrix.example == 'rustler'
+        if: matrix.examples == 'rustler'
         with:
           toolchain: "1.99.0"
           targets: wasm32-wasip1-threads
@@ -155,4 +230,4 @@ jobs:
         run: cargo update --manifest-path examples/rustler/native/textkit/Cargo.toml -p rustler --precise ${{ matrix.rustler }}
 
       - name: End-to-end suite
-        run: elixir scripts/examples.exs ${{ matrix.example }}
+        run: elixir scripts/examples.exs ${{ matrix.examples }}
